@@ -1,0 +1,870 @@
+#Скрипт рег работ по SI
+cls
+
+#Состояние проверок компонентов сервера по умолчанию
+$global:Check_SQL_srv = $False
+$global:Check_ES_srv = $False
+
+#Проверка наличия БД на сервере
+$SQL_srv_check = Get-Service sqlserv*, sqlwrit* | select Name, Displayname, status
+[bool]$global:Check_SQL_srv = if ($SQL_srv_check) { $True } else { $False }
+
+#Проверка наличия Endpoint на сервере
+$ES_srv_check = Get-Service SIMHsv* | select Name, Displayname, status
+[bool]$global:Check_ES_srv = if ($ES_srv_check) { $True } else { $False }
+
+##########################################################################################################################
+#2 Проверка хардов на сервере
+function HardDiskMemoryCheck{
+
+Write-Host ('2 - Проверка дисковых хранилищ информации -') -ForegroundColor Yellow -BackgroundColor Gray
+
+#первая проверка для корректного табличного вывода
+$Space_on_disk_result = Get-WmiObject -Class Win32_LogicalDisk |
+Select-Object -Property DeviceID, @{Label='Свободное место на диске (Gb)'; expression={($_.FreeSpace/1GB).ToString('F2')}},
+@{Label='Всего памяти (Gb)'; expression={($_.Size/1GB).ToString('F2')}},
+@{label='Свободно места в процентах'; expression={[Math]::Round(($_.freespace / $_.size) * 100, 2)}}|ft
+echo $Space_on_disk_result
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_harddisk = 0
+
+#вторая проверка для корректной работы цикла for
+[array]$Space_on_disk = Get-WmiObject -Class Win32_LogicalDisk 
+
+#Текстовый вывод единого формата проверки системы
+for ($iter = 0;$iter -cne $Space_on_disk.Count;$iter++){
+
+    #Проверка на дисковод вместо жесткого диска
+    if (!$Space_on_disk[$iter].Size){ continue }
+
+    #Выявление минимального порога размера диска от общего размера диска
+    if ($Space_on_disk[$iter].Size -le 214748364800){$Space_on_disk_size = 21474836480}#Если размер Диска меньше 200GB то 20 GB
+    if ($Space_on_disk[$iter].Size -ge 214748364800 -and $Space_on_disk.Size -le 536870912000){$Space_on_disk_size = 42949672960}#Если размер Диска больше 200GB меньше 500GB то 40GB
+    if ($Space_on_disk[$iter].Size -ge 536870912000){$Space_on_disk_size = 107374182400}#Если размер Диска больше 500GB то 100 GB
+
+    #Проверка диска в случае если на нем кол-во места менее допустимого
+    if ($Space_on_disk[$iter].FreeSpace -le $Space_on_disk_size){
+ 
+       Write-Host ('Объем диска менее', ($Space_on_disk_size/1GB) ,'ГБ требуется очистка диска.', $Space_on_disk[$iter].Name) -ForegroundColor Red -BackgroundColor Gray
+       $global:Counter_error_harddisk++
+    }
+  else
+    {
+       Write-Host ('Проверка диска', $Space_on_disk[$iter].Name, 'выполнена успешно, свободное место на диске более', ($Space_on_disk_size/1GB), 'ГБ' ) -ForegroundColor Green -BackgroundColor blue
+    }
+
+}
+
+#Создание массива объектов для вывода в отчёт
+[System.object]$global:mass_obj_report = @()
+
+#Цикл для вывода информации о хардах в массив для отчёта
+for ($iter = 0;$iter -cne $Space_on_disk.Count;$iter++){
+
+    #Проверка на дисковод вместо жесткого диска
+    if (!$Space_on_disk[$iter].Size){ continue }
+
+    #Цикл проверок всех дисков в случае > или < 10ГБ (Цифры в байтах)
+    if ($Space_on_disk[$iter].FreeSpace -le 10737418240){
+
+        $global:mass_obj_report += [pscustomobject]@{
+            Disk_name=$space_on_disk[$iter].Name;
+            Total_disk_size=([Math]::Round($space_on_disk[$iter].Size/1GB));
+            Free_space_on_disk=([Math]::Round($space_on_disk[$iter].FreeSpace/1GB));
+            Result_disk_checking='Требуется очистка диска'
+            }
+    }
+  else
+    {
+        $global:mass_obj_report += [pscustomobject]@{
+            Disk_name=$space_on_disk[$iter].Name;
+            Total_disk_size=([Math]::Round($space_on_disk[$iter].Size/1GB));
+            Free_space_on_disk=([Math]::Round($space_on_disk[$iter].FreeSpace/1GB));
+            Result_disk_checking='Проверка места на диске выполнена успешно'
+            }
+
+    }
+
+ }
+
+}
+
+###########################################################################################################################
+#3 Проверка очереди на дисках
+function HardDiskQueueCheck{
+
+Write-Host ('3 - Проверка очереди на дисках - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Выявление основного языка ОС для корректного запроса данных о очередях
+$System_language_check = Get-UICulture
+
+if ($System_language_check.Name -eq "en-US"){ 
+$Queue_on_disk = Get-Counter -Counter "\logicalDisk(*)\Current Disk Queue Length" 
+}
+else
+{
+[array]$Queue_on_disk = Get-Counter -Counter "\логический диск(*)\Текущая длина очереди диска" 
+}
+
+echo 'Проверка очереди на дисках :'
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_hardqueue = 0
+
+#Создание массива объектов для корректного вывода отчёта
+$global:queue_on_disk_report = @()
+
+for ($iter = 0;$iter -lt ($Queue_on_disk.CounterSamples).Count;$iter++){
+
+    #Проверка на общее значение очереди _total, если TRUE то итерация будет пропущена
+    if (($Queue_on_disk.CounterSamples[$iter]).InstanceName -eq "_total"){ continue }
+
+    if(($Queue_on_disk.CounterSamples[$iter]).CookedValue -le 5){
+        
+        Write-Host ('Длина очереди не превышает допустимое значение, длина очередей на данный момент: ',($Queue_on_disk.CounterSamples).InstanceName[$iter], "=", ($Queue_on_disk.CounterSamples).cookedvalue[$iter]) -ForegroundColor Green -BackgroundColor Blue
+        
+        $global:queue_on_disk_report += [pscustomobject]@{Hard_drive_name='';Queue_length='';Result_queue_harddrive_checking=''}
+        $global:queue_on_disk_report[$iter].Hard_drive_name = ($Queue_on_disk.CounterSamples[$iter]).InstanceName
+        $global:queue_on_disk_report[$iter].Queue_length = ($Queue_on_disk.CounterSamples[$iter]).cookedvalue
+        $global:queue_on_disk_report[$iter].Result_queue_harddrive_checking = 'Длина очереди на диске не превышает допустимых значений'
+    }
+    else
+    {
+        Write-Host ('Длина очередей превышает допустимое значение, длина очередей на данный момент: ', ($Queue_on_disk.CounterSamples).InstanceName[$iter], "=", ($Queue_on_disk.CounterSamples).cookedvalue[$iter]) -ForegroundColor Red -BackgroundColor Gray
+
+        $global:queue_on_disk_report += [pscustomobject]@{Hard_drive_name='';Queue_length='';Result_queue_harddrive_checking=''}
+        $global:queue_on_disk_report[$iter].Hard_drive_name = ($Queue_on_disk.CounterSamples[$iter]).InstanceName
+        $global:queue_on_disk_report[$iter].Queue_length = ($Queue_on_disk.CounterSamples[$iter]).cookedvalue
+        $global:queue_on_disk_report[$iter].Result_queue_harddrive_checking = 'Длина очереди превышает допустимое значение'
+        $global:Counter_error_hardqueue++
+    }
+}
+
+write-host "Проверка очереди на дисках завершена"
+
+}
+
+###########################################################################################################################
+#4 Проверка нагрузки на процессор
+function CpuUsageAvgCheck{
+Write-Host ('4 - Расчёт нагрузки на процессор - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+$time_temp = @()
+
+$timer = new-timespan -seconds 10
+$clock = [diagnostics.stopwatch]::StartNew()
+while ($clock.elapsed -lt $timer){
+$command=Get-WmiObject Win32_Processor | Select-Object -expand LoadPercentage
+echo 'Загрузка процессора в % на данный момент: '
+$command
+$time_temp = $time_temp + $command
+start-sleep -seconds 1
+}
+write-host "Время проверки нагрузки на процессор истекло."
+
+$cpu_usage = 0
+
+for ($iter = 0;$iter -le $time_temp.Count;$iter++){
+    $cpu_usage = $cpu_usage + $time_temp[$iter]
+}
+
+#Расчёт средней загрузки процессора
+$cpu_usage = [math]::Round($cpu_usage / $time_temp.Count)
+
+#Создание массива объектов для вывода в отчёт
+$global:CPU_usage_report = @() 
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_processor = 0
+
+#Вывод состояния нагрузки на процессор для пользователя
+if ($cpu_usage -le 80){
+    Write-Host ('Нагрузка на процессор', $cpu_usage ,'% что соответствует норме') -ForegroundColor Green -BackgroundColor Blue
+    $global:CPU_usage_report += [pscustomobject]@{CPU_average_usage_PC=$cpu_usage;Result_CPU_test='Нагрузка соответствует допустимым значениям'}
+}
+else
+{
+    Write-Host ('Нагрузка на процессор', $cpu_usage ,'% что не соответствует норме') -ForegroundColor Red -BackgroundColor Gray
+    $global:CPU_usage_report += [pscustomobject]@{CPU_average_usage_PC=$cpu_usage;Result_CPU_test='Нагрузка превышает допустимые значения'}
+    $global:Counter_error_processor++
+
+    #При превышении допустимой загрузки процессора покажет 5 самых загруженных процессов ОС
+    Write-Host ('Самые нагруженные процессы в системе:')
+    $CPU_usage = @{Name = 'CPU_usage';Expression = {$TotalSec = (New-TimeSpan -Start $_.StartTime).TotalSeconds; [Math]::Round( ($_.CPU * 100 / $TotalSec), 2)}}
+    Get-Process | Select-Object -Property Name, ID, $CPU_usage, Description | Sort-Object -Property CPU_usage -Descending | Select-Object -First 5 | ft
+}
+
+}
+
+###########################################################################################################################
+#5 Проверка служб Searchinform
+function ServiceSearchCheck{
+
+Write-Host ('5 - Проверка состояния служб SearchInform - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+echo 'Службы Searchinform и их статус: '
+[array]$Service_mass = Get-Service Search*, SI* | select Name, Displayname, status
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_services = 0
+
+#Создание массива объектов для вывода в отчёт
+[array]$global:service_status_report = @()
+
+#Проверка на отсутствие служб SI на АРМ для отчета
+    if ($Service_mass -eq $null){
+        echo 'Службы SearchInform отсутствуют на АРМ'
+        $global:service_status_report += [pscustomobject]@{Service_name='Службы SI отсутствуют на АРМ';Service_status=' - ';Result_service_checking=' - '}
+    }
+  
+#Вывод данных о состоянии служб на экран + формирование данных для отчёта
+for ($iter = 0;$iter -cne $Service_mass.Count;$iter++){
+
+    if ($Service_mass[$iter].Status -eq 'Stopped'){
+        write-host('Служба SearchInform -', $Service_mass[$iter].Name,'остановлена') -ForegroundColor Red -BackgroundColor Gray
+
+            $global:service_status_report += [pscustomobject]@{Service_name='';Service_status='';Result_service_checking=''}
+            $global:service_status_report[$iter].Service_name = $Service_mass[$iter].Name
+            $global:service_status_report[$iter].Service_status = $Service_mass[$iter].Status
+            $global:service_status_report[$iter].Result_service_checking = 'Служба остановлена, требуется проверка'
+            $global:Counter_error_services++
+            }
+    else
+    {           
+        write-host('Служба Searchinform -',  $Service_mass[$iter].Name,'запущена') -ForegroundColor Green -BackgroundColor Blue
+
+            $global:service_status_report += [pscustomobject]@{Service_name='';Service_status='';Result_service_checking=''}
+            $global:service_status_report[$iter].Service_name = $Service_mass[$iter].Name
+            $global:service_status_report[$iter].Service_status = $Service_mass[$iter].Status
+            $global:service_status_report[$iter].Result_service_checking = 'Проверка работы службы выполненна успешно'
+            }
+}
+write-host 'Проверка состояния служб завершена'
+
+}
+
+###########################################################################################################################
+#6 Проверка синхронизации Data Center с Active Directory
+function DcSyncAdCheck{
+
+Write-Host ('6 - Проверка синхронизации Data Center с Active Directory - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Задаем имя сервера с БД
+$PC_instance = $env:computername
+
+#Поиск по названию БД DataCenter
+$SQL_DB_Table_Name = Invoke-Sqlcmd -ServerInstance $PC_instance -Query "Select name from sys.sysdatabases where name in ('si_dc', 'dc', 'DataCenter', 'DataCenter_AD', 'DataCenter_AD1', 'si_dc_ad')" 
+[string]$DB_Table_name_DC = $SQL_DB_Table_Name.name
+
+
+#Создаем запрос к БД с передачей имени ПК как параметра и запросом к БД записанным в переменную SQL_DC_Sync_Result
+$SQL_DC_Sync_Result = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_name_DC -Query "select DisplayName, LastSyncDate from DC_DomainsInfo"
+
+#Получаем сегодняшнюю дату
+$Today_Date = Get-Date
+
+#Присваиваем переменной значение объекта SQL запроса "Имя домена"
+$Domain_Name = $SQL_DC_Sync_Result.DisplayName
+
+#Присваиваем переменной значение объекта SQL запроса "Время последней синхронизации"
+[datetime]$Domain_Sync_Time = $SQL_DC_Sync_Result.LastSyncDate[0]
+
+#Вычитаем дату последней синхронизации Domain_Sync_Time из сегодняшней даты Today_Date
+$Time_After_Last_Sync = $Today_Date - $Domain_Sync_Time
+
+#Вывод данных о последней синхронизации DC с AD
+Write-Host ('С момента последней синхронизации прошло: ', $Time_After_Last_Sync.Seconds, ' секунд ',$Time_After_Last_Sync.Minutes,' минут', $Time_After_Last_Sync.Hours,' часов', $Time_After_Last_Sync.Days, ' дней')
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_DC_check = 0
+
+if ($Time_After_Last_Sync.Hours -le 3){
+    Write-Host ('Проверка синхронизации Data Center выполненна успешно') -ForegroundColor Green -BackgroundColor Blue
+    $Check_DC_result = 'Успешно'
+}
+else
+{
+    Write-Host ('Проверка синхронизации Data Center не удалась, требуется проверка') -ForegroundColor Red -BackgroundColor Gray
+    $Check_DC_result = 'Неудачно'
+    $global:Counter_error_DC_check++
+}
+
+#Создание массива объектов для корректного вывода отчёта
+$global:Last_Sync_DC_report = @()
+
+#Вывод объекта с данными о синхронизации под отчёт
+$global:Last_Sync_DC_report += [pscustomobject]@{Domain_Sync_Name="$Domain_name";DC_Sync_Last_Date="$Domain_Sync_Time";Result_DC_Sync_Checking="$Check_DC_result"}
+
+}
+###########################################################################################################################
+#Проверка и контроль превышения лицензий
+
+function LicenseOverspendCheck{
+
+Write-Host (' - Проверка превышения лицензий - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Задаем имя сервера с БД
+$PC_instance = $env:computername
+
+#Поиск по названию БД DataCenter
+$SQL_DB_Table_Name = Invoke-Sqlcmd -ServerInstance $PC_instance -Query "Select name from sys.sysdatabases where name in ('si_dc', 'dc', 'DataCenter', 'DataCenter_AD', 'DataCenter_AD1', 'si_dc_ad')" 
+[string]$DB_Table_name_DC = $SQL_DB_Table_Name.name
+
+#Создание проверки для выполнения кода в случае пустого возврата от БД
+[bool]$Check_SQL_return_empty = $False
+
+#Получение сегодняшней даты
+$Today_date = Get-Date -Format "dd/MM/yyyy"
+
+#Массив с Названиями модулей
+[array]$Module_Names_Mass = @("Indexing Workstation (user PC)","PrintController","DeviceController","MonitorController","Keylogger","MailController (integration)","IMController (integration)","SkypeController","FileController","HTTPController (EC)","MailController (EC)","IMController (EC)","FTPController (EC)","File Auditor & FileController (user PC)")
+
+#Массив с SQL запросами по лицензиям
+[array]$SQL_query_mass = @("select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'Indexing Workstation (user PC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'PrintController'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'DeviceController'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())
+","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'MonitorController'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'Keylogger'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'MailController (integration)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'IMController (integration)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'SkypeController'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'FileController'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())
+","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'HTTPController (EC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'MailController (EC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'IMController (EC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())
+","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'FTPController (EC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())","select product_name as 'Module_license',
+convert(date,Rec_DateOf,116) as 'Date',
+Count_Licenses-Count_Required as 'Overspending_license'
+ FROM $DB_Table_name_DC.dbo.LS_History left join $DB_Table_name_DC.dbo.LS_Products on $DB_Table_name_DC.dbo.LS_History.Product_ID = $DB_Table_name_DC.dbo.LS_Products.Product_ID
+where Count_Required > Count_Licenses
+and Product_Name = 'File Auditor & FileController (user PC)'
+and Rec_DateOf >  DATEADD(day,-30,GETDATE())")
+
+#Объявление массива объектов для вывода в отчет
+$global:Mass_License_Report = @()
+
+for ($i = 0;$i -lt $SQL_query_mass.Count;$i++){
+#Создаем запрос к БД с передачей имени ПК как параметра, запросом к БД из массива
+[array]$SQL_License_Mass = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_name_DC -Query $SQL_query_mass[$i]
+
+#Проверка на пустой возврат результата при запросе от БД
+if ($SQL_License_Mass -eq $null){
+Write-Host ('Отсутствуют данные о превышении лицензий модуля', $Module_Names_Mass[$i])
+$Check_SQL_return_empty = $True
+}
+else
+{
+$Check_SQL_return_empty = $False
+}
+
+#В случае пустого возврата от БД
+$buff_str = $Module_Names_Mass[$i]
+$global:Mass_License_Report += [pscustomobject]@{Today_Overspending_License="Отсутствуют данные по модулю $buff_str";Max_Overspending_License=" - "}
+
+#Выполнять если результат запроса к БД не пустой
+if ($Check_SQL_return_empty -eq $False){
+
+#Создание объекта по данным лицензии модуля
+$global:Mass_License_Report += [pscustomobject]@{Today_Overspending_License="";Max_Overspending_License=""}
+
+###
+#Вывод данных о превышении лицензий на сегодня\вчера
+Write-Host (' Данные о превышении лицензий на сегодня/вчера модуля', $SQL_License_Mass[0].Module_license,'') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Сортировка данных запроса SQL по дате
+$Today_Check_License_overspending = $SQL_License_Mass | Sort-Object -Property "Date"
+
+#Проверка на совпадение даты записи о превышении с сегодняшней датой
+$Check_Date_license = get-date $Today_Check_License_overspending[$Today_Check_License_overspending.Count - 1].Date -Format "dd/MM/yyyy"
+
+#Парсинг строк в даты для корректного сравнения
+$parsed_Today_date = [DateTime]::ParseExact($Today_date, "dd.MM.yyyy", $null)
+$parsed_Check_Date_license = [DateTime]::ParseExact($Check_Date_license, "dd.MM.yyyy", $null)
+
+if  ($parsed_Check_Date_license -eq $parsed_Today_date.AddDays(-1)){
+    $Today_Overspending_Licensing = [math]::Abs($Today_Check_License_overspending[$Today_Check_License_overspending.Count - 1].Overspending_license)
+    Write-Host ('Превышение лицензий на сегодня/вчера =', [math]::Abs($Today_Check_License_overspending[$Today_Check_License_overspending.Count - 1].Overspending_license))
+    $global:Mass_License_Report[$i].Today_Overspending_License="$Today_Overspending_Licensing"
+}
+else
+{
+    Write-Host ('Данные о превышении лицензий на сегодня/вчера отсутствуют')
+    $buff_str = $Module_Names_Mass[$i]
+    $global:Mass_License_Report[$i].Today_Overspending_License="Данные модуля $buff_str на сегодня отсутствуют"
+    $global:Mass_License_Report[$i].Max_Overspending_License=" - " 
+}
+
+###
+#Вывод данных о превышении лицензий за последние 30 дней
+Write-Host (' Последние данные о превышении лицензий модуля', $SQL_License_Mass[0].Module_license,'') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Вывод данных о превышении лицензий на сегодняшний день
+for ($iter = 0;$iter -lt $SQL_License_Mass.Count;$iter++){
+    Write-Host ('Дата превышения лицензий',(get-date $SQL_License_Mass[$iter].Date -Format "dd/MM/yyyy"), '- Кол-во превышений лицензии =', [math]::Abs($SQL_License_Mass[$iter].Overspending_license))
+}
+
+###
+#Вывод максимального значения превышения лицензий за последние 30 дней в формате дата + количество лицензий
+Write-Host (' Максимальное превышение лицензий модуля', $SQL_License_Mass[0].Module_license, 'за последние 30 дней ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Вывод дня с максимальным превышением лицензий модуля за последние 30 дней
+$Day_with_MAX_License_overspending = $SQL_License_Mass | Sort-Object -Property "Overspending_license"
+
+#Присвоение данных из объекта DataTable переменным для корректного вывода
+$Date_with_MAX_License_overspending = get-date $Day_with_MAX_License_overspending[0].Date -Format "dd/MM/yyyy"
+$CountLicense_with_MAX_License_overspending = [math]::Abs($Day_with_MAX_License_overspending[0].Overspending_license)
+
+Write-Host ('Дата максимального превышения = ', $Date_with_MAX_License_overspending, 'Кол-во превышений лицензии =',$CountLicense_with_MAX_License_overspending)
+$global:Mass_License_Report[$i].Max_Overspending_License = "Дата максимального превышения $Date_with_MAX_License_overspending Кол-во превышений лицензии = $CountLicense_with_MAX_License_overspending"
+
+
+}#Блок if модуля лицензий закончился
+
+Write-Host (' ------ ') -ForegroundColor Yellow -BackgroundColor Gray
+}
+##############
+
+}
+
+###########################################################################################################################
+#7 Проверка очереди в консолях ES
+function EsQueueCheck{
+
+Write-Host ('7 - Проверка очереди в консолях ES - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Получение конфиг файла в формате XML, парсинг и полуение значения config.message_directory с путем к файлу очередей messages
+[xml]$XML_data_in_config = Get-Content -Path "C:\Program Files (x86)\SearchInform\SearchInform EndpointSniffer\service\SIMHSvc.config"
+$path_to_directory_messages = $XML_data_in_config.config.message_directory
+
+#Расчёт очереди на сервере в консолях ES
+$Size_ES_query = [math]::Round((Get-ChildItem -path $path_to_directory_messages -Recurse | Measure-Object -ErrorAction SilentlyContinue -Property length -s).sum / 1Mb, 2) 
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_ES_query = 0
+
+#Проверка состояния очереди на соответствие норме
+if($Size_ES_query -le 5120){
+    Write-Host ('Длина очереди в консолях ES составляет = ', $Size_ES_query, 'МБ')
+    Write-Host ('Длина очереди в консолях ES не превышает допустимое значение') -ForegroundColor Green -BackgroundColor Blue
+    $ES_query_check_result = "Успешно"
+}
+else
+{
+    Write-Host ('Длина очереди в консолях ES составляет = ', $Size_ES_query, ' МБ')
+    Write-Host ('Длина очереди в консолях ES превышает допустимое значение') -ForegroundColor Red -BackgroundColor Gray
+    $ES_query_check_result = "Неудачно"
+    $global:Counter_error_ES_query++
+}
+
+#Создание массива объектов для корректного вывода отчёта
+$global:Size_ES_query_report = @()
+
+#Вывод объекта с данными о синхронизации под отчёт
+$global:Size_ES_query_report += [pscustomobject]@{ES_query_length_MB="$Size_ES_query";Result_ES_query_Checking="$ES_query_check_result"}
+
+}
+
+###########################################################################################################################
+#8 Проверка состояния большинства агентов на АРМ
+function ArmActiveCheck{
+Write-Host ('8 - Проверка активности большинства агентов на АРМ - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Задаем имя сервера с БД
+$PC_instance = $env:computername
+
+#Поиск по названию БД EndpointController
+$SQL_DB_Table_Name = Invoke-Sqlcmd -ServerInstance $PC_instance -Query "Select name from sys.sysdatabases where name in ('si_es', 'si_ec', 'es', 'EndpointController', 'ec', 'ec_op', 'endpoint1', 'endpoint')"
+[string]$DB_Table_name = $SQL_DB_Table_Name.name
+
+#Создаем запрос к БД с данными о АРМ с активными агентами
+$SQL_ES_total_agent_result = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_Name -Query "SELECT COUNT ([name]) 
+FROM [ams_accounts]
+where ams_account_type_id = '10' and operatingSystem not like 'NULL' 
+	and operatingSystem not like '%server%' 
+	and operatingSystem not like '%unknown%' 
+	and ams_status = '1'"
+
+#Вывод данных о общем количестве АРМ с агентами
+write-host ("Всего АРМ с агентом SI : ", $SQL_ES_total_agent_result.Column1)
+
+#Создаем запрос к БД с данными о АРМ с активными агентами
+$SQL_ES_active_agent_result = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_Name -Query "DECLARE @Date DATETIME
+SET @Date = (SELECT GETDATE() - '1900-01-01 00:15:00.000')
+SELECT COUNT ([name]) 
+FROM [ams_accounts]
+where ams_account_type_id = '10' and operatingSystem not like 'NULL' 
+	and operatingSystem not like '%server%' 
+	and operatingSystem not like '%unknown%' 
+	and ams_status = '1'
+	and ams_last_agent_activity >= @Date "
+
+#Вывод данных о общем количестве АРМ с активными агентами
+write-host ("Всего АРМ c активным агентом SI: ", $SQL_ES_active_agent_result.Column1)
+
+#Преобразование данных и расчёт соотношения агентов от активных к общему
+[int]$Total_ARM = $SQL_ES_total_agent_result.Column1
+[int]$Active_agent_ARM = $SQL_ES_active_agent_result.Column1
+$percent_ARM = [math]::Round(($Active_agent_ARM / $Total_ARM * 100), 2)
+
+#Объявление счетчика ошибок в модуле
+[int]$global:Counter_error_ES_ARM_active = 0
+
+#Проверка состояния большинства агентов в системе, требуется более 80% активных
+if ($percent_ARM -ge 75){
+write-host ("Активные агенты от общего количества АРМ с агентами составляют : ", $percent_ARM, "%") -ForegroundColor Green -BackgroundColor Blue
+}
+else
+{
+write-host ("Активные агенты от общего количества АРМ с агентами составляют : ", $percent_ARM, "%") -ForegroundColor Red -BackgroundColor Gray
+$global:Counter_error_ES_ARM_active++
+}
+
+#Создание массива объектов для корректного вывода отчёта
+$global:Total_Agent_check_result = @()
+
+#Вывод объекта с данными о синхронизации под отчёт
+$global:Total_Agent_check_result += [pscustomobject]@{Total_ARM_with_agent="$Total_ARM";Total_ARM_with_active_agent="$Active_agent_ARM";Percent_ARM_active="$percent_ARM"}
+}
+
+
+##########################################################################################################################
+#9 Проверка состояния автоустановки агентов
+function AutoInstallCheck{
+Write-Host ('9 - Проверка состояния автоустановки агентов - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Задаем имя сервера с БД
+$PC_instance = $env:computername
+
+#Поиск по названию БД EndpointController
+$SQL_DB_Table_Name = Invoke-Sqlcmd -ServerInstance $PC_instance -Query "Select name from sys.sysdatabases where name in ('si_es', 'si_ec', 'es', 'EndpointController', 'ec', 'ec_op', 'endpoint1', 'endpoint')"
+[string]$DB_Table_name = $SQL_DB_Table_Name.name
+
+#Создаем запрос к БД с данными
+$SQL_AC_incident_data = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_Name -Query "SELECT TOP (100) 
+	   [id]
+      ,[order_id]
+      ,[name]
+      ,[checked]
+      ,[action]
+  FROM [$DB_Table_name].[dbo].[ams_policies]"
+
+echo "Состояние политик автоустановки:"
+
+for ($iter = 0;$iter -cne $SQL_AC_incident_data.Count;$iter++){
+if ($SQL_AC_incident_data[$iter].checked -eq $True) { $Checked_autoinstall = "применяется" } else { $Checked_autoinstall = "не работает" }
+if ($Checked_autoinstall -eq "применяется") {Write-Host ('Политика автоустановки -', $SQL_AC_incident_data[$iter].name, 'в состоянии -', $Checked_autoinstall) -ForegroundColor Green -BackgroundColor blue}
+else 
+{ Write-Host ('Политика автоустановки -', $SQL_AC_incident_data[$iter].name, 'в состоянии -', $Checked_autoinstall) -ForegroundColor Red -BackgroundColor Gray }
+}
+
+}
+
+
+##########################################################################################################################
+#13 Проверка инцидентов в AlertCenter
+function AlertCenterIncidentCheck{
+Write-Host ('13 - Проверка последних инцидентов в AC - ') -ForegroundColor Yellow -BackgroundColor Gray
+
+#Задаем имя сервера с БД
+$PC_instance = $env:computername
+
+#Поиск по названию БД AlertCenter
+$SQL_DB_Table_Name = Invoke-Sqlcmd -ServerInstance $PC_instance -Query "Select name from sys.sysdatabases where name in ('ac','si_ac','alertcenter2','alertcenter')"
+[string]$DB_Table_name = $SQL_DB_Table_Name.name
+
+#Создаем запрос к БД с данными
+$SQL_AC_incident_data = Invoke-Sqlcmd -ServerInstance $PC_instance -Database $DB_Table_Name -Query "SELECT TOP (1) PERCENT
+      [AlertTime]
+      ,[IndexID]
+      ,[AlertID]
+  FROM [$DB_Table_name].[dbo].[AlertResults]
+  order by AlertTime desc"
+
+#Проверка на пустой возврат результата при запросе от БД
+if ($SQL_AC_incident_data -eq $null){
+Write-Host ('Отсутствуют данные о инцидентах в AlertCenter')
+$Check_SQL_AC_return_empty = $True
+}
+else
+{
+$Check_SQL_AC_return_empty = $False
+}
+
+#Если результат запроса не пустной, выполнять проверку совпадения дат:
+if ($Check_SQL_AC_return_empty -eq $False){
+
+#Получение сегодняшней даты для проверки
+$Today_date_check_AC = Get-Date -format "dd.MM.yyyy"
+
+#Получаем дату последнего инцидента
+$Today_incident_date = $SQL_AC_incident_data[0].AlertTime
+$Today_incident_date = (Get-Date).ToString("dd.MM.yyyy")
+
+#Проверка наличия данных за сегодня и вывод информации на экран
+if ($Today_date_check_AC -eq $Today_incident_date){
+   Write-Host ('Данные по инцидентам за', $Today_date_check_AC ,'присутствую в консолях АС') -ForegroundColor Green -BackgroundColor blue
+}
+else
+{
+   Write-Host ('Данные по инцидентам за', $Today_date_check_AC ,'отсутствуют в консолях АС') -ForegroundColor Red -BackgroundColor Gray 
+}
+
+}#Конец if блока
+
+}
+
+###########################################################################################################################
+#Модуль вывода Отчёта
+function OutReport{
+param (
+$Counter_error_harddisk,
+$Counter_error_hardqueue, 
+$Counter_error_processor, 
+$Counter_error_services, 
+$Counter_error_DC_check, 
+$Counter_error_ES_query, 
+$Counter_error_ES_ARM_active, 
+[pscustomobject[]]$mass_obj_report, 
+[pscustomobject[]]$queue_on_disk_report, 
+[pscustomobject[]]$CPU_usage_report, 
+[pscustomobject[]]$service_status_report, 
+[pscustomobject[]]$Last_Sync_DC_report, 
+[pscustomobject[]]$Mass_License_Report,
+[pscustomobject[]]$Size_ES_query_report, 
+[pscustomobject[]]$Total_Agent_check_result 
+)
+
+#Проверка существования папки для отчетов
+[string]$Path_Report_check = Test-Path -Path "C:\Report_system_status\"
+
+if ($Path_Report_check -eq "False"){
+ #Создание директории на диске С для вывода отчетов
+ New-Item -Path 'C:\Report_system_status\' -ItemType Directory
+}
+
+#Получение имени ПК или сервера для названия отчета
+$PC_instance_report_header1 = $env:computername
+
+#Вывод конечного отчёта по проверке жестких дисков в читаемый формат
+$mass_obj_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt 
+
+#Вывод конечного отчёта по проверке очереди на дисках в читаемый формат
+$queue_on_disk_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по средней нагрузке процессора в читаемый формат
+$CPU_usage_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по состоянию служб SI в читаемый формат
+$service_status_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по состоянию синхронизации DataCenter с AD
+$Last_Sync_DC_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по состоянию лицензий установленных модулей
+$Mass_License_Report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по состоянию очередей на сервере ES
+$Size_ES_query_report | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Вывод конечного отчёта по состоянию очередей на сервере ES
+$Total_Agent_check_result | format-list | Out-File -FilePath C:\Report_system_status\System_status.txt -Append
+
+#Проверка ошибок для вывода заголовка в отчет
+if ($Counter_error_harddisk -gt 0 -or $Counter_error_hardqueue -gt 0 -or $Counter_error_processor -gt 0 -or $Counter_error_services -gt 0 -or $Counter_error_DC_check -gt 0 -or $Counter_error_ES_query -gt 0 -or $Counter_error_ES_ARM_active -gt 0){
+$Header1_str = "Проверка состояния сервера $PC_instance_report_header1 SearchInform Неудачно"
+}
+else
+{
+$Header1_str = "Проверка состояния сервера $PC_instance_report_header1 SearchInform Успешно"
+}
+
+#Преобразование данных в строки для htm отчета
+$mass_obj_report_str = $mass_obj_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния жестких дисков</h2>' | Out-String
+$queue_on_disk_report_str = $queue_on_disk_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка очереди на жестких дисках</h2>' | Out-String
+$CPU_usage_report_str = $CPU_usage_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка средней нагрузки на процессор</h2>' | Out-String
+$service_status_report_str = $service_status_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния служб SearchInform</h2>' | Out-String
+
+#Преобразование данных для Htm отчета при наличии БД на узле
+if ($Check_SQL_srv -eq $True){
+$Last_Sync_DC_report_str = $Last_Sync_DC_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния синхронизации DataCenter с AD</h2>' | Out-String
+}
+
+#Преобразование данных для Htm отчета при наличии БД на узле
+if ($Check_SQL_srv -eq $True){
+$Mass_License_Report_str = $Mass_License_Report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния лицензий установленных модулей SI</h2>' | Out-String
+}
+
+#Преобразование данных для Htm отчета при наличии SI ES на узле
+if ($Check_ES_srv -eq $True){
+$Size_ES_query_report_str = $Size_ES_query_report | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния очереди на сервере ES</h2>' | Out-String
+}
+
+#Преобразование данных для Htm отчета при наличии БД на узле
+if ($Check_SQL_srv -eq $True){
+$Total_Agent_check_result_report_str = $Total_Agent_check_result | ConvertTo-Html -As LIST -Fragment –PreContent '<h2>Проверка состояния большинства АРМ с агентом</h2>' | Out-String
+}
+
+#Описание Headera для Htm отчета
+$head = @'
+<style>
+body { background-color:#d4f1fa;
+           font-family:Tahoma;
+	   font-size:14pt; }
+td, th { border:3px solid black;
+           border-collapse:collapse; }
+th { color:white;
+           background-color:black; }
+           table, tr, td, th { padding: 3px; margin: 0px }
+table { margin-left:60px; }
+</style>
+'@
+
+#Получение даты создания отчёта
+$Today_date_to_report = Get-Date -Format dd-MM-yyyy
+
+#Получение имени ПК или сервера для названия файла отчета
+$PC_instance = $env:computername
+
+#Строка название файла отчета
+[string]$String_file_name = "$PC_instance System_status $Today_date_to_report"
+
+#Создание отчёта в формате Htm и наполнение его данными если на сервере есть:
+
+#Есть БД и Модули SI
+if ($Check_SQL_srv -eq $True -and $Check_ES_srv -eq $True)
+{
+$html_report = ConvertTo-HTML -head $head -PostContent $mass_obj_report_str, $queue_on_disk_report_str, $CPU_usage_report_str, $service_status_report_str,$Size_ES_query_report_str , $Last_Sync_DC_report_str, $Mass_License_Report_str, $Total_Agent_check_result_report_str -PreContent "<h1>$Header1_str</h1>"
+}
+
+#Нет БД и есть модуль SI
+if ($Check_SQL_srv -ne $True -and $Check_ES_srv -eq $True){
+$html_report = ConvertTo-HTML -head $head -PostContent $mass_obj_report_str, $queue_on_disk_report_str, $CPU_usage_report_str, $service_status_report_str, $Size_ES_query_report_str -PreContent "<h1>$Header1_str</h1>"
+}
+
+#Есть БД и нет модуля SI
+if ($Check_SQL_srv -eq $True -and $Check_ES_srv -ne $True){
+$html_report = ConvertTo-HTML -head $head -PostContent $mass_obj_report_str, $queue_on_disk_report_str, $CPU_usage_report_str, $service_status_report_str, $Last_Sync_DC_report_str, $Mass_License_Report_str, $Total_Agent_check_result_report_str -PreContent "<h1>$Header1_str</h1>"
+}
+
+#Нет модулей SI и БД
+if ($Check_SQL_srv -ne $True -and $Check_ES_srv -ne $True){
+$html_report = ConvertTo-HTML -head $head -PostContent $mass_obj_report_str, $queue_on_disk_report_str, $CPU_usage_report_str, $service_status_report_str -PreContent "<h1>$Header1_str</h1>"
+}
+
+
+#Проверка наличия ошибок при выводе отчета, в случае если ошибок нет будет OK, иначе BAD
+if ($Counter_error_harddisk -gt 0 -or $Counter_error_hardqueue -gt 0 -or $Counter_error_processor -gt 0 -or $Counter_error_services -gt 0 -or $Counter_error_DC_check -gt 0 -or $Counter_error_ES_query -gt 0 -or $Counter_error_ES_ARM_active -gt 0){
+$html_report | Out-File -FilePath C:\Report_system_status\BAD_$String_file_name.htm
+}
+else
+{
+$html_report | Out-File -FilePath C:\Report_system_status\OK_$String_file_name.htm
+}
+Write-Host "Отчёт по состоянию системы в формате Htm сформирован" -ForegroundColor Cyan -BackgroundColor Gray
+}
+
+###########################################################################################################################
+#Инструкции по вызову функций в зависимости от сервера
+
+#Алгоритм работы программы, последовательность вызова функций в зависимости от наличия компонентов сервера
+HardDiskMemoryCheck
+HardDiskQueueCheck
+CpuUsageAvgCheck
+ServiceSearchCheck
+if ($Check_SQL_srv -eq $True) {DcSyncAdCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+if ($Check_SQL_srv -eq $True) {LicenseOverspendCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+if ($Check_ES_srv -eq $True) {EsQueueCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+if ($Check_SQL_srv -eq $True) {ArmActiveCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+if ($Check_SQL_srv -eq $True) {AutoInstallCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+if ($Check_SQL_srv -eq $True) {AlertCenterIncidentCheck} #Запуск модуля если проверка пройдена(Проверка в начале скрипта)
+
+#Есть БД и Модули SI
+if ($Check_SQL_srv -eq $True -and $Check_ES_srv -eq $True)
+{
+OutReport -Counter_error_harddisk $Counter_error_harddisk  -Counter_error_hardqueue $Counter_error_hardqueue -Counter_error_processor $Counter_error_processor -Counter_error_services $Counter_error_services -Counter_error_DC_check $Counter_error_DC_check -Counter_error_ES_query $Counter_error_ES_query -Counter_error_ES_ARM_active $Counter_error_ES_ARM_active -mass_obj_report $mass_obj_report -queue_on_disk_report $queue_on_disk_report -CPU_usage_report $CPU_usage_report -service_status_report $service_status_report -Last_Sync_DC_report $Last_Sync_DC_report -Mass_License_Report $Mass_License_Report -Size_ES_query_report $Size_ES_query_report -Total_Agent_check_result $Total_Agent_check_result
+}
+
+#Нет БД и есть модуль SI
+if ($Check_SQL_srv -ne $True -and $Check_ES_srv -eq $True){
+OutReport -Counter_error_harddisk $Counter_error_harddisk  -Counter_error_hardqueue $Counter_error_hardqueue -Counter_error_processor $Counter_error_processor -Counter_error_services $Counter_error_services -Counter_error_DC_check $Counter_error_DC_check -Counter_error_ES_query $Counter_error_ES_query -Counter_error_ES_ARM_active $Counter_error_ES_ARM_active -mass_obj_report $mass_obj_report -queue_on_disk_report $queue_on_disk_report -CPU_usage_report $CPU_usage_report -service_status_report $service_status_report -Size_ES_query_report $Size_ES_query_report 
+}
+
+#Есть БД и нет модуля SI
+if ($Check_SQL_srv -eq $True -and $Check_ES_srv -ne $True){
+OutReport -Counter_error_harddisk $Counter_error_harddisk  -Counter_error_hardqueue $Counter_error_hardqueue -Counter_error_processor $Counter_error_processor -Counter_error_services $Counter_error_services -Counter_error_DC_check $Counter_error_DC_check -Counter_error_ES_query $Counter_error_ES_query -Counter_error_ES_ARM_active $Counter_error_ES_ARM_active -mass_obj_report $mass_obj_report -queue_on_disk_report $queue_on_disk_report -CPU_usage_report $CPU_usage_report -service_status_report $service_status_report -Last_Sync_DC_report $Last_Sync_DC_report -Mass_License_Report $Mass_License_Report -Total_Agent_check_result $Total_Agent_check_result
+}
+
+#Нет модулей SI и БД
+if ($Check_SQL_srv -ne $True -and $Check_ES_srv -ne $True){
+OutReport -Counter_error_harddisk $Counter_error_harddisk  -Counter_error_hardqueue $Counter_error_hardqueue -Counter_error_processor $Counter_error_processor -Counter_error_services $Counter_error_services -Counter_error_DC_check $Counter_error_DC_check -Counter_error_ES_query $Counter_error_ES_query -Counter_error_ES_ARM_active $Counter_error_ES_ARM_active -mass_obj_report $mass_obj_report -queue_on_disk_report $queue_on_disk_report -CPU_usage_report $CPU_usage_report -service_status_report $service_status_report
+}

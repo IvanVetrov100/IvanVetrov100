@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#Создание двух массивов, первый с паролями, второй с именем УЗ
+IFS=$'\n' Pass_date_mass=($(grep -v '^[^:]*:\(!.*\|\*\):' /etc/shadow | cut -d: -f 3))
+IFS=$'\n' User_date_mass=($(grep -v '^[^:]*:\(!.*\|\*\):' /etc/shadow | cut -d: -f 1))
+
+#Массив для количества дней от 1970-01-01
+human_date=()
+#Переменная для расчета и отображения корректной даты
+date_core="1970-01-01"
+
+#Цикл для записи в массив данных о дате в читаемом формате
+for ((i =0;i < ${#Pass_date_mass[@]};i++))
+do
+human_date[$i]+=$(date +%Y-%m-%d -d "$date_core + ${Pass_date_mass[$i]} days")
+done
+
+#Переменная с результатом вывода команды hostname
+Host_name=$(hostname)
+
+#Вывод конечных данных с разделителем формата
+result_output=$(for ((i = 0; i < ${#Pass_date_mass[@]};i++))
+do
+    if (( $i == 0 )); then
+    echo "Name;Date;Server"
+    echo -e '\r'
+    fi
+
+    echo \"${User_date_mass[$i]}\"
+    echo ";"
+    date_formating=$(date +%d-%m-%Y -d "${human_date[$i]}")
+    echo \"$date_formating\"
+    echo ";"
+    echo \"$Host_name\"
+    echo -e '\r'
+done)
+
+#Вывод данных в консоль и в файл
+echo $result_output
+echo $result_output > $Host_name.csv
